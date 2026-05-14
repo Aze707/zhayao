@@ -174,7 +174,7 @@ def imread_chinese(path):
 if __name__ == "__main__":
     detector = DefectDetector()
     
-    img = imread_chinese(r"G:\zhayao\image\3.bmp")
+    img = imread_chinese(r"G:\zhayao\image\6.bmp")
     
     if img is None:
         print(f"Error: 无法加载图像")
