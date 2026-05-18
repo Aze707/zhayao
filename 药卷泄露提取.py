@@ -10,169 +10,130 @@ class DefectDetector:
         self.blur_sigma = 75
         
         # 2. 颜色阈值 (HSV空间)
+        # 红色药卷精准区间 (要求提取准确，宁可漏掉一点边缘，绝不能把背景提取进来)
         self.lower_red1 = np.array([0, 70, 50])
         self.upper_red1 = np.array([13, 255, 255])
         self.lower_red2 = np.array([170, 70, 50])
         self.upper_red2 = np.array([180, 255, 255])
         
+        # 明亮黄色破损物精准区间
         self.lower_yellow = np.array([10, 35, 35])
         self.upper_yellow = np.array([45, 255, 255])
         
-        self.lower_shadow_white = np.array([0, 0, 140]) 
-        self.upper_shadow_white = np.array([180, 45, 220])
-        
-        # ================= [新增: 卡扣检测参数] =================
-        # 金属卡扣的反光特性：亮度高，色彩饱和度低
-        self.clip_v_min = 150  # 亮度下限 (根据实际打光可微调)
-        self.clip_s_max = 90   # 饱和度上限 (排除鲜艳的药卷和背景)
-        self.clip_min_area = 15
-        self.clip_max_area = 1200
-        # =========================================================
-
         # 3. 几何与拓扑参数
-        self.min_red_area = 2000    
-        self.min_yellow_area = 50   
-        self.max_yellow_area = 200000 
-        self.distance_threshold = -20
+        self.min_red_area = 2000    # 红色药卷最小面积(过滤噪点)
+        self.min_yellow_area = 50   # 黄色漏药最小面积
+        self.distance_threshold = -20 # 黄色中心点到红色轮廓的允许最大距离
 
     def preprocess(self, img):
+        """图像预处理：CLAHE光照均衡化 + 双边滤波去噪"""
         lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
         cl = self.clahe.apply(l)
         limg = cv2.merge((cl, a, b))
         img_clahe = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
+        
         img_blur = cv2.bilateralFilter(img_clahe, self.blur_d, self.blur_sigma, self.blur_sigma)
+
         return img_blur
 
     def get_clean_masks(self, img_hsv):
+        """获取极其精准的红色药卷掩码 和 明亮黄色掩码"""
         mask_red1 = cv2.inRange(img_hsv, self.lower_red1, self.upper_red1)
         mask_red2 = cv2.inRange(img_hsv, self.lower_red2, self.upper_red2)
         mask_red = cv2.bitwise_or(mask_red1, mask_red2)
+        
         mask_yellow = cv2.inRange(img_hsv, self.lower_yellow, self.upper_yellow)
         
         kernel_open = np.ones((3, 3), np.uint8)
-        kernel_close = np.ones((3, 3), np.uint8)
+        kernel_close = np.ones((7, 7), np.uint8)
         
+        # 红色精准清理
         mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, kernel_open)
         mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_CLOSE, kernel_close, iterations=2)
-        mask_yellow = cv2.morphologyEx(mask_yellow, cv2.MORPH_OPEN, kernel_open)
-        return mask_red, mask_yellow
-    
-    def separate_adhesion_morphology(self, mask_binary):
-        contours, _ = cv2.findContours(mask_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        solid_mask = np.zeros_like(mask_binary)
-        cv2.drawContours(solid_mask, contours, -1, 255, thickness=cv2.FILLED)
         
-        kernel_h = 25
-        kernel_w = 3
-        kernel_vertical = np.ones((kernel_h, kernel_w), np.uint8)
-        separated_mask = cv2.morphologyEx(solid_mask, cv2.MORPH_OPEN, kernel_vertical)
-        return separated_mask
+        # 黄色精准清理
+        mask_yellow = cv2.morphologyEx(mask_yellow, cv2.MORPH_OPEN, kernel_open)
+        
+        return mask_red, mask_yellow
 
     def get_loose_combined_mask(self, img_bgr):
+        """
+        差分核心 1：极其宽松地提取所有目标（药卷主体 + 阴影褐色漏药）
+        """
         lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+        
+        # ====== 核心修改点 ======
+        # a 通道 > 120 (排除偏绿的噪点)
+        # b 通道从 128 提高到 136！
+        # 136 是一个分水岭：它足以把深灰色的传送带（~130）无情地踩在脚下过滤掉，
+        # 同时又足够低，能把阴影里暗褐色的漏药（~140+）和红色的药卷捞上来。
         lower_lab = np.array([0, 120, 136]) 
         upper_lab = np.array([255, 255, 255]) 
+        # ========================
+        
         mask_combined = cv2.inRange(lab, lower_lab, upper_lab)
+        
+        # 闭运算填补内部空洞，使其成为坚实的整体
         kernel_close = np.ones((3, 3), np.uint8)
         mask_combined = cv2.morphologyEx(mask_combined, cv2.MORPH_CLOSE, kernel_close)
+        
         return mask_combined
 
     def extract_contours(self, mask_red, mask_yellow):
+        """提取并过滤轮廓"""
         contours_red, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         contours_yellow, _ = cv2.findContours(mask_yellow, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         valid_red = [cnt for cnt in contours_red if cv2.contourArea(cnt) > self.min_red_area]
+        valid_yellow = [cnt for cnt in contours_yellow if cv2.contourArea(cnt) > self.min_yellow_area]
         
-        valid_yellow = []
-        for cnt in contours_yellow:
-            area = cv2.contourArea(cnt)
-            if self.min_yellow_area < area < self.max_yellow_area:
-                valid_yellow.append(cnt)
         return valid_red, valid_yellow
 
-    # ================= [新增: 尺度自适应卡扣检测模块] =================
-    def detect_clips(self, img_hsv, valid_red_contours):
-        """
-        利用药卷几何特征定位端点，并基于动态尺度进行卡扣检测。
-        全程无固定像素尺寸裁剪，保证尺度一致性。
-        """
-        # 1. 提取全局金属特征掩码 (低S, 高V)
-        _, s, v = cv2.split(img_hsv)
-        mask_s = s < self.clip_s_max
-        mask_v = v > self.clip_v_min
-        metal_mask = cv2.bitwise_and(mask_s.astype(np.uint8)*255, mask_v.astype(np.uint8)*255)
-
-        # 消除零星噪点
-        kernel = np.ones((3,3), np.uint8)
-        metal_mask = cv2.morphologyEx(metal_mask, cv2.MORPH_OPEN, kernel)
-
-        clip_boxes = []
-
-        # 2. 为每个药卷动态划定端点搜索区域
-        for cnt in valid_red_contours:
-            if len(cnt) < 5: continue 
-            
-            rect = cv2.minAreaRect(cnt)
-            box = cv2.boxPoints(rect)
-            
-            # 计算矩形四条边的长度，寻找短边所在的两个端点中心
-            d1 = np.linalg.norm(box[0] - box[1])
-            d2 = np.linalg.norm(box[1] - box[2])
-            
-            if d1 > d2:
-                # d1 是长边，d2 是短边(宽度)
-                width = d2
-                pt1 = (box[0] + box[3]) / 2.0
-                pt2 = (box[1] + box[2]) / 2.0
-            else:
-                width = d1
-                pt1 = (box[0] + box[1]) / 2.0
-                pt2 = (box[2] + box[3]) / 2.0
-
-            pt1 = (int(pt1[0]), int(pt1[1]))
-            pt2 = (int(pt2[0]), int(pt2[1]))
-
-            # 基于药卷实际宽度动态设定搜索半径，通常端点卡扣延伸不超过宽度的1倍
-            search_radius = int(width * 1.0) 
-            
-            # 构建仅包含药卷两端的动态搜索掩码
-            search_mask = np.zeros_like(metal_mask)
-            cv2.circle(search_mask, pt1, search_radius, 255, -1)
-            cv2.circle(search_mask, pt2, search_radius, 255, -1)
-
-            # 3. 掩码交集，仅在药卷两端寻找金属特征
-            local_metal = cv2.bitwise_and(metal_mask, search_mask)
-            
-            clip_contours, _ = cv2.findContours(local_metal, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            for c_cnt in clip_contours:
-                area = cv2.contourArea(c_cnt)
-                if self.clip_min_area < area < self.clip_max_area:
-                    x, y, cw, ch = cv2.boundingRect(c_cnt)
-                    clip_boxes.append((x, y, cw, ch))
-
-        return clip_boxes
-    # =========================================================
-
     def detect(self, img):
+        """主检测逻辑流（基于轮廓填充与差分）"""
+        # 1. 预处理
         img_pre = self.preprocess(img)
         img_hsv = cv2.cvtColor(img_pre, cv2.COLOR_BGR2HSV)
         
+        # 2. 提取精准的红色药卷掩码 (Mask A) 和 明亮黄色掩码
         mask_red_accurate, mask_yellow_hsv = self.get_clean_masks(img_hsv)
-        mask_red_accurate = self.separate_adhesion_morphology(mask_red_accurate)
+        
+        # ================= [填补 Mask A 的内部孔洞] =================
+        # 数学逻辑：将有孔洞的A转化为绝对实心的 A_solid
+        contours_A, _ = cv2.findContours(mask_red_accurate, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        mask_red_solid = np.zeros_like(mask_red_accurate)
+        cv2.drawContours(mask_red_solid, contours_A, -1, 255, thickness=cv2.FILLED)
+        
+        mask_red_accurate = mask_red_solid # 更新为实心掩码
+        # ==============================================================
+
+        # 3. 提取宽松的合并掩码 (Mask C = 药卷 + 暗色漏药)
+        # 注意：此方法内的闭运算核切记不可太大，不能吞噬药卷间的物理缝隙！
         mask_combined = self.get_loose_combined_mask(img_pre)
         
+        # ================= [边缘公差抵消与逻辑减法] =================
+        # 4a. 膨胀实心红色掩码
+        # 将 1x1 修改为 5x5。目的是让 A 胖一小圈，防止 C-A 运算后留下药卷的外轮廓线。
+        # 如果您发现减法后还是有一圈白边，可以把 5x5 改为 7x7 或更大。
         kernel_dilate = np.ones((5, 5), np.uint8)
         mask_red_dilated = cv2.dilate(mask_red_accurate, kernel_dilate, iterations=1)
+        
+        # 4b. 逻辑减法 (C - A_dilated)
         mask_dark_spill = cv2.subtract(mask_combined, mask_red_dilated)
 
+        # 4c. 开运算清理减法后残留的零星极小噪点 (保留 3x3 即可，5x5 可能会把小的真实漏药也刷掉)
         kernel_open = np.ones((3, 3), np.uint8)
         mask_dark_spill = cv2.morphologyEx(mask_dark_spill, cv2.MORPH_OPEN, kernel_open)
+        # ==============================================================
         
+        # 5. 合并最终的漏药掩码 (亮黄色 + 暗褐色)
         mask_yellow_final = cv2.bitwise_or(mask_yellow_hsv, mask_dark_spill)
+        
+        # 6. 提取目标轮廓 (使用实心的 mask_red_accurate 提取红圈，完全不影响外围判断)
         valid_red, valid_yellow = self.extract_contours(mask_red_accurate, mask_dark_spill)
         
+        # 7. 空间拓扑关联判定
         defective_red_indices = set()
         for y_cnt in valid_yellow:
             M = cv2.moments(y_cnt)
@@ -183,44 +144,49 @@ class DefectDetector:
             
             for idx, r_cnt in enumerate(valid_red):
                 dist = cv2.pointPolygonTest(r_cnt, yellow_center, True)
+                # 判断漏药中心距离药卷的距离，如果在阈值内，则判定为该药卷的 NG
                 if dist >= self.distance_threshold:
                     defective_red_indices.add(idx)
                     break
-        
-        # ================= [新增: 调用卡扣检测] =================
-        clip_boxes = self.detect_clips(img_hsv, valid_red)
-        # =======================================================
-
-        # 可视化输出
+                    
+        # 8. 可视化输出
+        # [修改点 1]：使用预处理后的亮图 (img_pre) 作为底图，解决亮度差异问题！
         result_img = img_pre.copy() 
+        
+        # [可选过滤]：如果想过滤掉图四背景里那几个比芝麻还小的白点，
+        # 可以利用已经提取好的 valid_yellow，生成一个干净的掩码。
+        # 如果您不在乎那几个小白点，可以直接用 result_img[mask_dark_spill == 255] = [0, 255, 255]
         clean_yellow_mask = np.zeros_like(mask_yellow_final)
         for y_cnt in valid_yellow:
             cv2.drawContours(clean_yellow_mask, [y_cnt], -1, 255, -1)
             
+        # [修改点 2]：不使用生硬的轮廓描边，直接利用掩码进行“像素级染色”
+        # 只要 clean_yellow_mask 中是白色的地方，就在底图上把它涂成纯黄色 (BGR: 0, 255, 255)
         result_img[clean_yellow_mask == 255] = [0, 255, 255]
         
+        # 画红框和 NG 标签 (保持不变)
         for idx, r_cnt in enumerate(valid_red):
             if idx in defective_red_indices:
-                cv2.drawContours(result_img, [r_cnt], -1, (0, 128, 0), 20) 
+                cv2.drawContours(result_img, [r_cnt], -1, (0, 128, 0), 25) 
                 x, y, w, h = cv2.boundingRect(r_cnt)
                 cv2.putText(result_img, "NG", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
             else:
-                cv2.drawContours(result_img, [r_cnt], -1, (0, 255, 0), 2) 
-
-        # ================= [新增: 绘制卡扣边界框] =================
-        for (x, y, cw, ch) in clip_boxes:
-            cv2.rectangle(result_img, (x, y), (x + cw, y + ch), (0, 0, 255), 2) 
-        # =======================================================
+                cv2.drawContours(result_img, [r_cnt], -1, (0, 255, 0), 1) 
                 
+        # 返回：结果图, 精准红掩码(A), 最终黄掩码(减法结果), 宽松总掩码(C), 预处理图
         return result_img, mask_red_accurate, mask_dark_spill, mask_combined, img_pre
-
+    
 def imread_chinese(path):
     data = np.fromfile(path, dtype=np.uint8)
     return cv2.imdecode(data, cv2.IMREAD_COLOR)
 
+
 # ================= 使用示例 =================
 if __name__ == "__main__":
     detector = DefectDetector()
+    
+    # image_path = r"G:\zhayao\2.bmp"
+    # img = cv2.imread(image_path)
     
     img = imread_chinese(r"G:\zhayao\image\3.bmp")
     
@@ -229,6 +195,7 @@ if __name__ == "__main__":
     else:
         result, mask_r, mask_y, mask_combined, img_pre = detector.detect(img)
         
+        # 颜色空间转换 (BGR -> RGB)
         img_pre_rgb = cv2.cvtColor(img_pre, cv2.COLOR_BGR2RGB)
         result_rgb = cv2.cvtColor(result, cv2.COLOR_BGR2RGB)
 
@@ -236,27 +203,29 @@ if __name__ == "__main__":
 
         plt.subplot(2, 3, 1) 
         plt.imshow(img_pre_rgb)
-        plt.title("1. Pre-processed")
+        plt.title("1. Pre-processed Image")
         plt.axis('off')
 
         plt.subplot(2, 3, 2)
         plt.imshow(mask_r, cmap='gray')
-        plt.title("2. Cut Red Mask (A)")
+        plt.title("2. Accurate Red Mask (A)")
         plt.axis('off')
 
+        # [新增] 显示宽泛提取的合并掩码
         plt.subplot(2, 3, 3)
         plt.imshow(mask_combined, cmap='gray')
-        plt.title("3. Combined Mask (C)")
+        plt.title("3. Combined Mask (C) \n[All Warm Colors]")
         plt.axis('off')
 
+        # 显示减法得到的结果
         plt.subplot(2, 3, 4)
         plt.imshow(mask_y, cmap='gray')
-        plt.title("4. Spill Mask")
+        plt.title("4. Yellow Mask (C - A_dilated)")
         plt.axis('off')
 
         plt.subplot(2, 3, 5)
         plt.imshow(result_rgb)
-        plt.title("5. Final Result")
+        plt.title("5. Final Detection Result")
         plt.axis('off')
 
         plt.tight_layout()
