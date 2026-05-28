@@ -1,0 +1,19 @@
+# 全局配置文件
+# 包含相机参数、模型路径、标定矩阵、TCP端口等
+# config.yaml
+system:
+  fps_limit: 20
+  debug_mode: true
+
+camera:
+  type: "mock" # 真实场景可改为 "hikvision" 或 "dahua"
+  exposure: 5000
+  gain: 10
+
+model:
+  weights_path: "models/weights/yolov8_obb_best.pt"
+  conf_threshold: 0.7
+  iou_threshold: 0.45
+
+grasping:
+  safe_margin_px: 45 # 避障安全偏置距离(像素)

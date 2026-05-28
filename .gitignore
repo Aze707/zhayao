@@ -1,0 +1,9 @@
+# 屏蔽特定文件夹 (注意后面要加斜杠)
+image/
+.vscode/
+
+
+
+# 屏蔽 Python 运行产生的缓存
+__pycache__/
+*.pyc
