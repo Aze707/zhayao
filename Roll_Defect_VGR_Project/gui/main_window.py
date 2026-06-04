@@ -37,6 +37,8 @@ class VisionWorker(QThread):
         self.real_image_dir = r"G:\zhayao\image"
         self.image_list = []
         self.image_index = 0
+
+        self.cap = None
         
         # =========================================================================
         # 【核心新增】控制变量：用于实现手动单帧步进查验功能
@@ -84,58 +86,87 @@ class VisionWorker(QThread):
                 self.log_signal.emit(f"⚠️ 警告：文件夹内无符合格式的照片，自动降级为 mock。")
                 self.source_mode = "mock"
 
+        elif self.source_mode == "camera":
+            print("\n" + "="*50)
+            print("[硬件诊断] 正在尝试拉起物理相机数据流...")
+            
+            # 初始化相机，0 通常指代系统默认的第一个摄像头（如笔记本自带或首个 USB 相机）
+            # 工业部署提示：如果是工业相机（如大恒、海康），通常建议用对应厂商的 Python SDK 获取图像，再转为 Numpy
+            # 若仍用 OpenCV 调取 USB 工业相机，Windows 下推荐加上 cv2.CAP_DSHOW 提速并避免黑屏
+            self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+            
+            # 尝试设置期望分辨率 (根据你的药卷检测视野需求调整)
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+            
+            if not self.cap.isOpened():
+                print("[致命错误] 无法建立相机硬件连接！请检查 USB 接口、设备管理器驱动或是否被其他软件占用。")
+                self.log_signal.emit("⚠️ 致命错误：硬件相机调用失败，强制降级为 mock 模式。")
+                self.source_mode = "mock"
+            else:
+                # 读取实际生效的分辨率用于日志确认
+                actual_w = self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+                actual_h = self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+                print(f"[成功] 相机已挂载！当前物理分辨率: {actual_w} x {actual_h}")
+                self.log_signal.emit(f"📷 物理相机连接成功，分辨率: {int(actual_w)}x{int(actual_h)}。")
+            print("="*50 + "\n")
+
     def run(self):
         self.is_running = True
         self.log_signal.emit(f"🚀 视觉算法线程已启动。运行模式: [{self.source_mode}]")
         self.pipeline.initialize()
         
-        # 记录上一帧图像，防止手动挂起时界面刷空白
-        last_frame = self._mock_capture()
+        # =========================================================================
+        # 1. 变量安全初始化 (解决 UnboundLocalError 的核心)
+        # =========================================================================
+        # 获取一张初始兜底图
+        initial_frame = self._capture_frame() if self.source_mode != "mock" else self._mock_capture()
+        if initial_frame is None:
+            initial_frame = self._mock_capture()
+            
+        # 初始状态缓存，防止手动模式下刚启动时崩溃
+        processed_frame = initial_frame.copy() 
         last_payload = []
         
-        # 标志位：指示是否需要读取并解算新的一帧
+        # 是否需要进行新一轮解算的控制开关
         need_process = True
         
         while self.is_running:
-            # =========================================================================
-            # 【核心单步控制逻辑】
-            # =========================================================================
+            # 2. 状态机判断：决定当前帧要不要更新数据
             if self.is_manual_mode:
                 if self.next_frame_trigger:
-                    # 用户点击了“下一张”按钮，放行一次读图与解算流程
                     need_process = True
-                    self.next_frame_trigger = False # 消费掉当前触发信号
+                    self.next_frame_trigger = False # 消费掉触发信号
                 else:
-                    # 如果用户没点击，不执行新读图，直接渲染上一帧画面保持界面不卡死
-                    need_process = False
+                    need_process = False # 手动模式挂起，只用旧数据渲染
             else:
-                # 自动流模式下，永远放行读图
-                need_process = True
+                need_process = True # 自动模式，永远放行
 
+            # 3. 核心解算流 (只在 need_process 为 True 时执行)
             if need_process:
-                # 1. 从文件夹检索最新画面
                 frame = self._capture_frame()
-                if frame is None:
+                if frame is not None:
+                    # 只有成功捕获到新图像，才去更新我们的渲染底图和解算数据
+                    processed_frame, last_payload = self.pipeline.process_frame(frame)
+                    
+                    # 触发统计更新与右侧富文本打印
+                    self._update_statistics(last_payload)
+                    self.grasp_data_signal.emit(last_payload)
+                else:
+                    # 如果突发抓图失败，短暂休眠，避免死循环
                     time.sleep(0.01)
                     continue
-                
-                # 2. 核心算法管道解算
-                _, payload_data = self.pipeline.process_frame(frame)
-                
-                # 缓存最新状态数据，供手动挂起时持续渲染使用
-                last_frame = frame
-                last_payload = payload_data
-                
-                # 更新全局计数看板
-                self._update_statistics(payload_data)
-                # 抛出信号通知右侧 HMI 富文本打印
-                self.grasp_data_signal.emit(payload_data)
 
-            # 5. 画布层可视化渲染（用缓存或新读入的 frame 持续给 QLabel 塞图，保证响应）
-            display_frame = self.visualizer.draw_results(last_frame, last_payload)
+            # 4. 统一渲染层
+            # 此时的 processed_frame 绝对是安全定义的（要么是初始化好的底图，要么是刚算出来的底图）
+            # last_payload 也绝对是安全的，只保存 NG 数据的字典列表
+            display_frame = self.visualizer.draw_results(processed_frame, last_payload)
+            
+            # 推送给 HMI 显示
             self.update_frame_signal.emit(display_frame)
             
-            time.sleep(0.03)
+            # 帧率控制
+            time.sleep(0.05)
 
     def trigger_next_frame(self):
         """外部槽函数接口：点击下一张按钮时调用，打通阻断状态"""
@@ -143,19 +174,37 @@ class VisionWorker(QThread):
 
     def stop(self):
         self.is_running = False
-        self.wait()
+        self.wait() # 阻塞当前上下文，等待 QThread 的 run() 循环彻底结束
+        
+        # 【新增】安全注销硬件资源
+        if self.cap is not None and self.cap.isOpened():
+            self.cap.release()
+            print("[资源回收] 相机句柄已安全释放。")
+            self.log_signal.emit("🛑 物理相机已断开。")
 
     def _capture_frame(self) -> np.ndarray:
+        # 1. 文件夹模式抓图逻辑
         if self.source_mode == "folder" and self.image_list:
             current_path = self.image_list[self.image_index]
             frame = cv2.imread(current_path)
-            
-            # 手动查验模式下，打印当前正在解析的文件名，极度方便核对特定 NG 药卷
             if self.is_manual_mode:
                 self.log_signal.emit(f"🔍 步进单帧解析 -> 文件名: {os.path.basename(current_path)}")
-                
             self.image_index = (self.image_index + 1) % len(self.image_list)
             return frame
+            
+        # =========================================================================
+        # 2. 【核心新增】物理相机实时抽帧逻辑
+        # =========================================================================
+        elif self.source_mode == "camera" and self.cap is not None:
+            ret, frame = self.cap.read()
+            if ret and frame is not None:
+                return frame
+            else:
+                # 工业现场常见异常：线缆松动导致的突然丢帧，需防止 None 穿透进 YOLO 导致引擎崩溃
+                self.log_signal.emit("⚠️ 警告：底图抓取失败（可能遭遇瞬时掉线或丢帧）。")
+                return self._mock_capture()
+                
+        # 3. 兜底逻辑
         return self._mock_capture()
 
     def _mock_capture(self):
